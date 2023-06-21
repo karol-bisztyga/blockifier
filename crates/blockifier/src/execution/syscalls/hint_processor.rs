@@ -22,20 +22,22 @@ use starknet_api::transaction::Calldata;
 use starknet_api::StarknetApiError;
 use thiserror::Error;
 
+use crate::abi::constants;
 use crate::execution::common_hints::HintExecutionResult;
 use crate::execution::entry_point::{
-    CallEntryPoint, CallInfo, CallType, ExecutionContext, OrderedEvent, OrderedL2ToL1Message,
+    CallEntryPoint, CallInfo, CallType, EntryPointExecutionContext, ExecutionResources,
+    OrderedEvent, OrderedL2ToL1Message,
 };
 use crate::execution::errors::EntryPointExecutionError;
 use crate::execution::execution_utils::{
-    felt_from_ptr, felt_range_from_ptr, stark_felt_to_felt, write_maybe_relocatable,
+    felt_range_from_ptr, stark_felt_from_ptr, stark_felt_to_felt, write_maybe_relocatable,
     ReadOnlySegment, ReadOnlySegments,
 };
 use crate::execution::syscalls::{
-    call_contract, deploy, emit_event, get_execution_info, library_call, library_call_l1_handler,
-    replace_class, send_message_to_l1, storage_read, storage_write, StorageReadResponse,
-    StorageWriteResponse, SyscallRequest, SyscallRequestWrapper, SyscallResponse,
-    SyscallResponseWrapper, SyscallResult, SyscallSelector,
+    call_contract, deploy, emit_event, get_block_hash, get_execution_info, library_call,
+    library_call_l1_handler, replace_class, send_message_to_l1, storage_read, storage_write,
+    StorageReadResponse, StorageWriteResponse, SyscallRequest, SyscallRequestWrapper,
+    SyscallResponse, SyscallResponseWrapper, SyscallResult, SyscallSelector,
 };
 use crate::state::errors::StateError;
 use crate::state::state_api::State;
@@ -46,6 +48,10 @@ pub type SyscallCounter = HashMap<SyscallSelector, usize>;
 pub enum SyscallExecutionError {
     #[error("Bad syscall_ptr; expected: {expected_ptr:?}, got: {actual_ptr:?}.")]
     BadSyscallPointer { expected_ptr: Relocatable, actual_ptr: Relocatable },
+    #[error("Cannot replace V1 class hash with V0 class hash: {class_hash}.")]
+    ForbiddenClassReplacement { class_hash: ClassHash },
+    #[error("Invalid address domain: {address_domain}.")]
+    InvalidAddressDomain { address_domain: StarkFelt },
     #[error(transparent)]
     InnerCallExecutionError(#[from] EntryPointExecutionError),
     #[error("Invalid syscall input: {input:?}; {info}")]
@@ -64,24 +70,27 @@ pub enum SyscallExecutionError {
     VirtualMachineError(#[from] VirtualMachineError),
     #[error("Syscall error.")]
     SyscallError { error_data: Vec<StarkFelt> },
-    #[error("Invalid address domain: {address_domain}.")]
-    InvalidAddressDomain { address_domain: StarkFelt },
 }
 
 // Needed for custom hint implementations (in our case, syscall hints) which must comply with the
 // cairo-rs API.
 impl From<SyscallExecutionError> for HintError {
     fn from(error: SyscallExecutionError) -> Self {
-        HintError::CustomHint(error.to_string())
+        HintError::CustomHint(error.to_string().into())
     }
 }
+
+/// Error codes returned by Cairo 1.0 code.
+pub const OUT_OF_GAS_ERROR: &str =
+    "0x000000000000000000000000000000000000000000004f7574206f6620676173"; // "Out of gas";
 
 /// Executes StarkNet syscalls (stateful protocol hints) during the execution of an entry point
 /// call.
 pub struct SyscallHintProcessor<'a> {
     // Input for execution.
     pub state: &'a mut dyn State,
-    pub context: &'a mut ExecutionContext,
+    pub resources: &'a mut ExecutionResources,
+    pub context: &'a mut EntryPointExecutionContext,
     pub call: CallEntryPoint,
 
     // Execution results.
@@ -107,7 +116,8 @@ pub struct SyscallHintProcessor<'a> {
 impl<'a> SyscallHintProcessor<'a> {
     pub fn new(
         state: &'a mut dyn State,
-        context: &'a mut ExecutionContext,
+        resources: &'a mut ExecutionResources,
+        context: &'a mut EntryPointExecutionContext,
         initial_syscall_ptr: Relocatable,
         call: CallEntryPoint,
         hints: &'a HashMap<String, Hint>,
@@ -115,6 +125,7 @@ impl<'a> SyscallHintProcessor<'a> {
     ) -> Self {
         SyscallHintProcessor {
             state,
+            resources,
             context,
             call,
             inner_calls: vec![],
@@ -161,7 +172,7 @@ impl<'a> SyscallHintProcessor<'a> {
     ) -> HintExecutionResult {
         let StarknetHint::SystemCall{ system: syscall } = hint else {
             return Err(HintError::CustomHint(
-                "Test functions are unsupported on starknet.".to_string()
+                "Test functions are unsupported on starknet.".into()
             ));
         };
         let initial_syscall_ptr = get_ptr_from_res_operand_unchecked(vm, syscall);
@@ -171,19 +182,40 @@ impl<'a> SyscallHintProcessor<'a> {
         self.increment_syscall_count(&selector);
 
         match selector {
-            SyscallSelector::CallContract => self.execute_syscall(vm, call_contract),
-            SyscallSelector::Deploy => self.execute_syscall(vm, deploy),
-            SyscallSelector::EmitEvent => self.execute_syscall(vm, emit_event),
-            SyscallSelector::GetExecutionInfo => self.execute_syscall(vm, get_execution_info),
-            SyscallSelector::LibraryCall => self.execute_syscall(vm, library_call),
-            SyscallSelector::LibraryCallL1Handler => {
-                self.execute_syscall(vm, library_call_l1_handler)
+            SyscallSelector::CallContract => {
+                self.execute_syscall(vm, call_contract, constants::CALL_CONTRACT_GAS_COST)
             }
-            SyscallSelector::ReplaceClass => self.execute_syscall(vm, replace_class),
-            SyscallSelector::SendMessageToL1 => self.execute_syscall(vm, send_message_to_l1),
-            SyscallSelector::StorageRead => self.execute_syscall(vm, storage_read),
-            SyscallSelector::StorageWrite => self.execute_syscall(vm, storage_write),
-            _ => Err(HintError::UnknownHint(format!("Unsupported syscall selector {selector:?}."))),
+            SyscallSelector::Deploy => self.execute_syscall(vm, deploy, constants::DEPLOY_GAS_COST),
+            SyscallSelector::EmitEvent => {
+                self.execute_syscall(vm, emit_event, constants::EMIT_EVENT_GAS_COST)
+            }
+            SyscallSelector::GetBlockHash => {
+                self.execute_syscall(vm, get_block_hash, constants::GET_BLOCK_HASH_GAS_COST)
+            }
+            SyscallSelector::GetExecutionInfo => {
+                self.execute_syscall(vm, get_execution_info, constants::GET_EXECUTION_INFO_GAS_COST)
+            }
+            SyscallSelector::LibraryCall => {
+                self.execute_syscall(vm, library_call, constants::LIBRARY_CALL_GAS_COST)
+            }
+            SyscallSelector::LibraryCallL1Handler => {
+                self.execute_syscall(vm, library_call_l1_handler, constants::LIBRARY_CALL_GAS_COST)
+            }
+            SyscallSelector::ReplaceClass => {
+                self.execute_syscall(vm, replace_class, constants::REPLACE_CLASS_GAS_COST)
+            }
+            SyscallSelector::SendMessageToL1 => {
+                self.execute_syscall(vm, send_message_to_l1, constants::SEND_MESSAGE_TO_L1_GAS_COST)
+            }
+            SyscallSelector::StorageRead => {
+                self.execute_syscall(vm, storage_read, constants::STORAGE_READ_GAS_COST)
+            }
+            SyscallSelector::StorageWrite => {
+                self.execute_syscall(vm, storage_write, constants::STORAGE_WRITE_GAS_COST)
+            }
+            _ => Err(HintError::UnknownHint(
+                format!("Unsupported syscall selector {selector:?}.").into(),
+            )),
         }
     }
 
@@ -205,6 +237,7 @@ impl<'a> SyscallHintProcessor<'a> {
         &mut self,
         vm: &mut VirtualMachine,
         execute_callback: ExecuteCallback,
+        base_gas_cost: u64,
     ) -> HintExecutionResult
     where
         Request: SyscallRequest + std::fmt::Debug,
@@ -213,18 +246,34 @@ impl<'a> SyscallHintProcessor<'a> {
             Request,
             &mut VirtualMachine,
             &mut SyscallHintProcessor<'_>,
+            &mut Felt252,
         ) -> SyscallResult<Response>,
     {
         let SyscallRequestWrapper { gas_counter, request } =
             SyscallRequestWrapper::<Request>::read(vm, &mut self.syscall_ptr)?;
 
-        let original_response = execute_callback(request, vm, self);
+        if gas_counter < base_gas_cost.into() {
+            //  Out of gas failure.
+            let out_of_gas_error =
+                StarkFelt::try_from(OUT_OF_GAS_ERROR).map_err(SyscallExecutionError::from)?;
+            let response: SyscallResponseWrapper<Response> =
+                SyscallResponseWrapper::Failure { gas_counter, error_data: vec![out_of_gas_error] };
+            response.write(vm, &mut self.syscall_ptr)?;
+
+            return Ok(());
+        }
+
+        // Execute.
+        let mut remaining_gas = gas_counter - Felt252::from(base_gas_cost);
+        let original_response = execute_callback(request, vm, self, &mut remaining_gas);
         let response = match original_response {
-            Ok(response) => SyscallResponseWrapper::Success { gas_counter, response },
-            Err(SyscallExecutionError::SyscallError { error_data: data }) => {
-                SyscallResponseWrapper::Failure { gas_counter, error_data: data }
+            Ok(response) => {
+                SyscallResponseWrapper::Success { gas_counter: remaining_gas, response }
             }
-            Err(err) => return Err(err.into()),
+            Err(SyscallExecutionError::SyscallError { error_data: data }) => {
+                SyscallResponseWrapper::Failure { gas_counter: remaining_gas, error_data: data }
+            }
+            Err(error) => return Err(error.into()),
         };
 
         response.write(vm, &mut self.syscall_ptr)?;
@@ -233,13 +282,13 @@ impl<'a> SyscallHintProcessor<'a> {
     }
 
     fn read_next_syscall_selector(&mut self, vm: &mut VirtualMachine) -> SyscallResult<StarkFelt> {
-        let selector = felt_from_ptr(vm, &mut self.syscall_ptr)?;
+        let selector = stark_felt_from_ptr(vm, &mut self.syscall_ptr)?;
 
         Ok(selector)
     }
 
     fn increment_syscall_count(&mut self, selector: &SyscallSelector) {
-        let syscall_count = self.context.resources.syscall_counter.entry(*selector).or_default();
+        let syscall_count = self.resources.syscall_counter.entry(*selector).or_default();
         *syscall_count += 1;
     }
 
@@ -402,7 +451,7 @@ pub fn read_call_params(
     vm: &VirtualMachine,
     ptr: &mut Relocatable,
 ) -> SyscallResult<(EntryPointSelector, Calldata)> {
-    let function_selector = EntryPointSelector(felt_from_ptr(vm, ptr)?);
+    let function_selector = EntryPointSelector(stark_felt_from_ptr(vm, ptr)?);
     let calldata = read_calldata(vm, ptr)?;
 
     Ok((function_selector, calldata))
@@ -412,8 +461,10 @@ pub fn execute_inner_call(
     call: CallEntryPoint,
     vm: &mut VirtualMachine,
     syscall_handler: &mut SyscallHintProcessor<'_>,
+    remaining_gas: &mut Felt252,
 ) -> SyscallResult<ReadOnlySegment> {
-    let call_info = call.execute(syscall_handler.state, syscall_handler.context)?;
+    let call_info =
+        call.execute(syscall_handler.state, syscall_handler.resources, syscall_handler.context)?;
     let raw_retdata = &call_info.execution.retdata.0;
 
     if call_info.execution.failed {
@@ -423,6 +474,7 @@ pub fn execute_inner_call(
     }
 
     let retdata_segment = create_retdata_segment(vm, syscall_handler, raw_retdata)?;
+    *remaining_gas -= stark_felt_to_felt(call_info.execution.gas_consumed);
 
     syscall_handler.inner_calls.push(call_info);
 
@@ -445,16 +497,16 @@ pub fn execute_library_call(
     syscall_handler: &mut SyscallHintProcessor<'_>,
     vm: &mut VirtualMachine,
     class_hash: ClassHash,
-    code_address: Option<ContractAddress>,
     call_to_external: bool,
     entry_point_selector: EntryPointSelector,
     calldata: Calldata,
+    remaining_gas: &mut Felt252,
 ) -> SyscallResult<ReadOnlySegment> {
     let entry_point_type =
         if call_to_external { EntryPointType::External } else { EntryPointType::L1Handler };
     let entry_point = CallEntryPoint {
         class_hash: Some(class_hash),
-        code_address,
+        code_address: None,
         entry_point_type,
         entry_point_selector,
         calldata,
@@ -462,9 +514,10 @@ pub fn execute_library_call(
         storage_address: syscall_handler.storage_address(),
         caller_address: syscall_handler.caller_address(),
         call_type: CallType::Delegate,
+        initial_gas: remaining_gas.clone(),
     };
 
-    execute_inner_call(entry_point, vm, syscall_handler)
+    execute_inner_call(entry_point, vm, syscall_handler, remaining_gas)
 }
 
 pub fn read_felt_array<TErr>(

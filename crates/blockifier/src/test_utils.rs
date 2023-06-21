@@ -2,6 +2,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+use cairo_vm::vm::runners::builtin_runner::{
+    BITWISE_BUILTIN_NAME, EC_OP_BUILTIN_NAME, HASH_BUILTIN_NAME, OUTPUT_BUILTIN_NAME,
+    POSEIDON_BUILTIN_NAME, RANGE_CHECK_BUILTIN_NAME, SIGNATURE_BUILTIN_NAME,
+};
 use starknet_api::block::{BlockNumber, BlockTimestamp};
 use starknet_api::core::{
     calculate_contract_address, ChainId, ClassHash, CompiledClassHash, ContractAddress,
@@ -19,11 +23,12 @@ use starknet_api::transaction::{
 use starknet_api::{calldata, patricia_key, stark_felt};
 
 use crate::abi::abi_utils::get_storage_var_address;
+use crate::abi::constants;
 use crate::block_context::BlockContext;
 use crate::execution::contract_class::{ContractClass, ContractClassV0, ContractClassV1};
 use crate::execution::entry_point::{
-    CallEntryPoint, CallExecution, CallInfo, CallType, EntryPointExecutionResult, ExecutionContext,
-    Retdata,
+    CallEntryPoint, CallExecution, CallInfo, CallType, EntryPointExecutionContext,
+    EntryPointExecutionResult, ExecutionResources, Retdata,
 };
 use crate::state::cached_state::{CachedState, ContractClassMapping, ContractStorageKey};
 use crate::state::errors::StateError;
@@ -171,6 +176,7 @@ pub fn get_test_contract_class() -> ContractClass {
 
 pub fn trivial_external_entry_point() -> CallEntryPoint {
     let contract_address = ContractAddress(patricia_key!(TEST_CONTRACT_ADDRESS));
+    let initial_gas = constants::INITIAL_GAS_COST.into();
     CallEntryPoint {
         class_hash: None,
         code_address: Some(contract_address),
@@ -180,6 +186,7 @@ pub fn trivial_external_entry_point() -> CallEntryPoint {
         storage_address: contract_address,
         caller_address: ContractAddress::default(),
         call_type: CallType::Call,
+        initial_gas,
     }
 }
 
@@ -306,11 +313,13 @@ pub fn create_deploy_test_state() -> CachedState<DictStateReader> {
 impl CallEntryPoint {
     // Executes the call directly, without account context.
     pub fn execute_directly(self, state: &mut dyn State) -> EntryPointExecutionResult<CallInfo> {
-        let mut context = ExecutionContext::new(
-            BlockContext::create_for_testing(),
+        let block_context = BlockContext::create_for_testing();
+        let mut context = EntryPointExecutionContext::new(
+            block_context.clone(),
             AccountTransactionContext::default(),
+            block_context.invoke_tx_max_n_steps,
         );
-        self.execute(state, &mut context)
+        self.execute(state, &mut ExecutionResources::default(), &mut context)
     }
 }
 
@@ -331,14 +340,14 @@ impl BlockContext {
 
     pub fn create_for_account_testing() -> BlockContext {
         let vm_resource_fee_cost = HashMap::from([
-            (String::from("n_steps"), 1_f64),
-            (String::from("pedersen"), 1_f64),
-            (String::from("range_check"), 1_f64),
-            (String::from("ecdsa"), 1_f64),
-            (String::from("bitwise"), 1_f64),
-            (String::from("poseidon"), 1_f64),
-            (String::from("output"), 1_f64),
-            (String::from("ec_op"), 1_f64),
+            (constants::N_STEPS_RESOURCE.to_string(), 1_f64),
+            (HASH_BUILTIN_NAME.to_string(), 1_f64),
+            (RANGE_CHECK_BUILTIN_NAME.to_string(), 1_f64),
+            (SIGNATURE_BUILTIN_NAME.to_string(), 1_f64),
+            (BITWISE_BUILTIN_NAME.to_string(), 1_f64),
+            (POSEIDON_BUILTIN_NAME.to_string(), 1_f64),
+            (OUTPUT_BUILTIN_NAME.to_string(), 1_f64),
+            (EC_OP_BUILTIN_NAME.to_string(), 1_f64),
         ]);
         BlockContext { vm_resource_fee_cost, ..BlockContext::create_for_testing() }
     }

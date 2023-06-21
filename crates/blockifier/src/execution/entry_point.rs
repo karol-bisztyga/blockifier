@@ -1,14 +1,17 @@
 use std::collections::HashSet;
 
-use cairo_vm::vm::runners::cairo_runner::ExecutionResources as VmExecutionResources;
+use cairo_felt::Felt252;
+use cairo_vm::vm::runners::cairo_runner::{
+    ExecutionResources as VmExecutionResources, RunResources,
+};
 use starknet_api::core::{ClassHash, ContractAddress, EntryPointSelector};
 use starknet_api::deprecated_contract_class::EntryPointType;
 use starknet_api::hash::StarkFelt;
 use starknet_api::state::StorageKey;
-use starknet_api::transaction::{Calldata, EthAddress, EventContent, L2ToL1Payload};
+use starknet_api::transaction::{Calldata, EthAddress, EventContent, Fee, L2ToL1Payload};
 
 use crate::abi::abi_utils::selector_from_name;
-use crate::abi::constants::CONSTRUCTOR_ENTRY_POINT_NAME;
+use crate::abi::constants;
 use crate::block_context::BlockContext;
 use crate::execution::deprecated_syscalls::hint_processor::SyscallCounter;
 use crate::execution::errors::{EntryPointExecutionError, PreExecutionError};
@@ -45,6 +48,15 @@ pub struct CallEntryPoint {
     pub storage_address: ContractAddress,
     pub caller_address: ContractAddress,
     pub call_type: CallType,
+    pub initial_gas: Felt252,
+}
+
+pub struct ConstructorContext {
+    pub class_hash: ClassHash,
+    // Only relevant in deploy syscall.
+    pub code_address: Option<ContractAddress>,
+    pub storage_address: ContractAddress,
+    pub caller_address: ContractAddress,
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -54,10 +66,11 @@ pub struct ExecutionResources {
 }
 
 #[derive(Debug, Clone)]
-pub struct ExecutionContext {
+pub struct EntryPointExecutionContext {
     pub block_context: BlockContext,
-    pub resources: ExecutionResources,
     pub account_tx_context: AccountTransactionContext,
+    // VM execution limits.
+    pub vm_run_resources: RunResources,
     /// Used for tracking events order during the current execution.
     pub n_emitted_events: usize,
     /// Used for tracking L2-to-L1 messages order during the current execution.
@@ -65,32 +78,55 @@ pub struct ExecutionContext {
     /// Used to track error stack for call chain.
     pub error_stack: Vec<(ContractAddress, String)>,
 }
-impl ExecutionContext {
-    pub fn new(block_context: BlockContext, account_tx_context: AccountTransactionContext) -> Self {
+impl EntryPointExecutionContext {
+    pub fn new(
+        block_context: BlockContext,
+        account_tx_context: AccountTransactionContext,
+        max_n_steps: u32,
+    ) -> Self {
         Self {
+            vm_run_resources: RunResources::new(max_n_steps as usize),
             n_emitted_events: 0,
             n_sent_messages_to_l1: 0,
             error_stack: vec![],
             block_context,
-            resources: ExecutionResources::default(),
             account_tx_context,
         }
     }
-}
 
-impl ExecutionContext {
+    /// Returns the maximum number of cairo steps allowed, given the max fee and gas price.
+    /// If fee is disabled, returns the global maximum.
+    pub fn max_steps(&self) -> usize {
+        if self.account_tx_context.max_fee == Fee(0) {
+            constants::MAX_STEPS_PER_TX
+        } else {
+            let gas_per_step = self
+                .block_context
+                .vm_resource_fee_cost
+                .get(constants::N_STEPS_RESOURCE)
+                .unwrap_or_else(|| {
+                    panic!("{} must appear in `vm_resource_fee_cost`.", constants::N_STEPS_RESOURCE)
+                });
+            let max_gas = self.account_tx_context.max_fee.0 / self.block_context.gas_price;
+            ((max_gas as f64 / gas_per_step).floor() as usize).min(constants::MAX_STEPS_PER_TX)
+        }
+    }
+
     /// Combines individual errors into a single stack trace string, with contract addresses printed
     /// alongside their respective trace.
     pub fn error_trace(&self) -> String {
-        let mut frame_errors: Vec<String> = vec![];
-        for (contract_address, trace_string) in self.error_stack.iter().rev() {
-            frame_errors.push(format!(
-                "Error in the called contract ({}):\n{}",
-                contract_address.0.key(),
-                trace_string
-            ));
-        }
-        frame_errors.join("\n")
+        self.error_stack
+            .iter()
+            .rev()
+            .map(|(contract_address, trace_string)| {
+                format!(
+                    "Error in the called contract ({}):\n{}",
+                    contract_address.0.key(),
+                    trace_string
+                )
+            })
+            .collect::<Vec<String>>()
+            .join("\n")
     }
 }
 
@@ -98,7 +134,8 @@ impl CallEntryPoint {
     pub fn execute(
         mut self,
         state: &mut dyn State,
-        context: &mut ExecutionContext,
+        resources: &mut ExecutionResources,
+        context: &mut EntryPointExecutionContext,
     ) -> EntryPointExecutionResult<CallInfo> {
         // Validate contract is deployed.
         let storage_address = self.storage_address;
@@ -115,8 +152,8 @@ impl CallEntryPoint {
         self.class_hash = Some(class_hash);
         let contract_class = state.get_compiled_contract_class(&class_hash)?;
 
-        execute_entry_point_call(self, contract_class, state, context).map_err(
-            |error| match error {
+        execute_entry_point_call(self, contract_class, state, resources, context).map_err(|error| {
+            match error {
                 // On VM error, pack the stack trace into the propagated error.
                 EntryPointExecutionError::VirtualMachineExecutionError(error) => {
                     context.error_stack.push((storage_address, error.try_to_vm_trace()));
@@ -130,8 +167,8 @@ impl CallEntryPoint {
                     }
                 }
                 other_error => other_error,
-            },
-        )
+            }
+        })
     }
 }
 
@@ -255,46 +292,38 @@ impl<'a> IntoIterator for &'a CallInfo {
 
 pub fn execute_constructor_entry_point(
     state: &mut dyn State,
-    context: &mut ExecutionContext,
-    class_hash: ClassHash,
-    code_address: Option<ContractAddress>,
-    storage_address: ContractAddress,
-    caller_address: ContractAddress,
+    resources: &mut ExecutionResources,
+    context: &mut EntryPointExecutionContext,
+    ctor_context: ConstructorContext,
     calldata: Calldata,
+    remaining_gas: Felt252,
 ) -> EntryPointExecutionResult<CallInfo> {
     // Ensure the class is declared (by reading it).
-    let contract_class = state.get_compiled_contract_class(&class_hash)?;
+    let contract_class = state.get_compiled_contract_class(&ctor_context.class_hash)?;
     let Some(constructor_selector) = contract_class.constructor_selector() else {
         // Contract has no constructor.
-        return handle_empty_constructor(
-            class_hash,
-            code_address,
-            calldata,
-            storage_address,
-            caller_address,
-        );
+        return handle_empty_constructor(ctor_context, calldata,remaining_gas);
     };
 
     let constructor_call = CallEntryPoint {
         class_hash: None,
-        code_address,
+        code_address: ctor_context.code_address,
         entry_point_type: EntryPointType::Constructor,
         entry_point_selector: constructor_selector,
         calldata,
-        storage_address,
-        caller_address,
+        storage_address: ctor_context.storage_address,
+        caller_address: ctor_context.caller_address,
         call_type: CallType::Call,
+        initial_gas: remaining_gas,
     };
 
-    constructor_call.execute(state, context)
+    constructor_call.execute(state, resources, context)
 }
 
 pub fn handle_empty_constructor(
-    class_hash: ClassHash,
-    code_address: Option<ContractAddress>,
+    ctor_context: ConstructorContext,
     calldata: Calldata,
-    storage_address: ContractAddress,
-    caller_address: ContractAddress,
+    remaining_gas: Felt252,
 ) -> EntryPointExecutionResult<CallInfo> {
     // Validate no calldata.
     if !calldata.0.is_empty() {
@@ -306,14 +335,15 @@ pub fn handle_empty_constructor(
 
     let empty_constructor_call_info = CallInfo {
         call: CallEntryPoint {
-            class_hash: Some(class_hash),
-            code_address,
+            class_hash: Some(ctor_context.class_hash),
+            code_address: ctor_context.code_address,
             entry_point_type: EntryPointType::Constructor,
-            entry_point_selector: selector_from_name(CONSTRUCTOR_ENTRY_POINT_NAME),
+            entry_point_selector: selector_from_name(constants::CONSTRUCTOR_ENTRY_POINT_NAME),
             calldata: Calldata::default(),
-            storage_address,
-            caller_address,
+            storage_address: ctor_context.storage_address,
+            caller_address: ctor_context.caller_address,
             call_type: CallType::Call,
+            initial_gas: remaining_gas,
         },
         ..Default::default()
     };

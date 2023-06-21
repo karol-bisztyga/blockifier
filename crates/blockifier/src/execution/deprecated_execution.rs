@@ -11,7 +11,8 @@ use crate::abi::constants::DEFAULT_ENTRY_POINT_SELECTOR;
 use crate::execution::contract_class::ContractClassV0;
 use crate::execution::deprecated_syscalls::hint_processor::DeprecatedSyscallHintProcessor;
 use crate::execution::entry_point::{
-    CallEntryPoint, CallExecution, CallInfo, EntryPointExecutionResult, ExecutionContext,
+    CallEntryPoint, CallExecution, CallInfo, EntryPointExecutionContext, EntryPointExecutionResult,
+    ExecutionResources,
 };
 use crate::execution::errors::{
     PostExecutionError, PreExecutionError, VirtualMachineExecutionError,
@@ -34,7 +35,8 @@ pub fn execute_entry_point_call(
     call: CallEntryPoint,
     contract_class: ContractClassV0,
     state: &mut dyn State,
-    context: &mut ExecutionContext,
+    resources: &mut ExecutionResources,
+    context: &mut EntryPointExecutionContext,
 ) -> EntryPointExecutionResult<CallInfo> {
     let VmExecutionContext {
         mut runner,
@@ -42,7 +44,7 @@ pub fn execute_entry_point_call(
         mut syscall_handler,
         initial_syscall_ptr,
         entry_point_pc,
-    } = initialize_execution_context(&call, contract_class, state, context)?;
+    } = initialize_execution_context(&call, contract_class, state, resources, context)?;
 
     let (implicit_args, args) = prepare_call_arguments(
         &call,
@@ -53,7 +55,7 @@ pub fn execute_entry_point_call(
     let n_total_args = args.len();
 
     // Fix the VM resources, in order to calculate the usage of this run at the end.
-    let previous_vm_resources = syscall_handler.context.resources.vm_resources.clone();
+    let previous_vm_resources = syscall_handler.resources.vm_resources.clone();
 
     // Execute.
     run_entry_point(&mut vm, &mut runner, &mut syscall_handler, entry_point_pc, args)?;
@@ -73,14 +75,15 @@ pub fn initialize_execution_context<'a>(
     call: &CallEntryPoint,
     contract_class: ContractClassV0,
     state: &'a mut dyn State,
-    context: &'a mut ExecutionContext,
+    resources: &'a mut ExecutionResources,
+    context: &'a mut EntryPointExecutionContext,
 ) -> Result<VmExecutionContext<'a>, PreExecutionError> {
     // Resolve initial PC from EP indicator.
     let entry_point_pc = resolve_entry_point_pc(call, &contract_class)?;
 
     // Instantiate Cairo runner.
     let proof_mode = false;
-    let mut runner = CairoRunner::new(&contract_class.0.program, "starknet", proof_mode)?;
+    let mut runner = CairoRunner::new(&contract_class.program, "starknet", proof_mode)?;
 
     let trace_enabled = true;
     let mut vm = VirtualMachine::new(trace_enabled);
@@ -92,6 +95,7 @@ pub fn initialize_execution_context<'a>(
     let initial_syscall_ptr = vm.add_memory_segment();
     let syscall_handler = DeprecatedSyscallHintProcessor::new(
         state,
+        resources,
         context,
         initial_syscall_ptr,
         call.storage_address,
@@ -105,7 +109,7 @@ pub fn resolve_entry_point_pc(
     call: &CallEntryPoint,
     contract_class: &ContractClassV0,
 ) -> Result<usize, PreExecutionError> {
-    let entry_points_of_same_type = &contract_class.0.entry_points_by_type[&call.entry_point_type];
+    let entry_points_of_same_type = &contract_class.entry_points_by_type[&call.entry_point_type];
     let filtered_entry_points: Vec<_> = entry_points_of_same_type
         .iter()
         .filter(|ep| ep.selector == call.entry_point_selector)
@@ -184,12 +188,15 @@ pub fn run_entry_point(
     entry_point_pc: usize,
     args: Args,
 ) -> Result<(), VirtualMachineExecutionError> {
+    // TODO(Dori,30/06/2023): propagate properly once VM allows it.
+    let run_resources = &mut None;
     let verify_secure = true;
     let program_segment_size = None; // Infer size from program.
     let args: Vec<&CairoArg> = args.iter().collect();
     runner.run_from_entrypoint(
         entry_point_pc,
         &args,
+        run_resources,
         verify_secure,
         program_segment_size,
         vm,
@@ -229,14 +236,13 @@ pub fn finalize_execution(
         .get_execution_resources(&vm)
         .map_err(VirtualMachineError::TracerError)?
         .filter_unused_builtins();
-    syscall_handler.context.resources.vm_resources += &vm_resources_without_inner_calls;
+    syscall_handler.resources.vm_resources += &vm_resources_without_inner_calls;
 
-    let full_call_vm_resources =
-        &syscall_handler.context.resources.vm_resources - &previous_vm_resources;
+    let full_call_vm_resources = &syscall_handler.resources.vm_resources - &previous_vm_resources;
     Ok(CallInfo {
         call,
         execution: CallExecution {
-            retdata: read_execution_retdata(vm, retdata_size, retdata_ptr)?,
+            retdata: read_execution_retdata(&vm, retdata_size, &retdata_ptr)?,
             events: syscall_handler.events,
             l2_to_l1_messages: syscall_handler.l2_to_l1_messages,
             failed: false,
